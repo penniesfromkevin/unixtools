@@ -47,6 +47,11 @@ import sys
 DEFAULT_DELAY = 1 # seconds
 DEFAULT_IOSTAT = 'Nxk'
 
+AGENTS = ('collectd', 'graphite')
+DEFAULT_AGENT = AGENTS[0]
+DEFAULT_HOST = '127.0.0.1'
+DEFAULT_PORT = 2878
+
 LOG_LEVELS = ('CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG')
 DEFAULT_LOG_LEVEL = LOG_LEVELS[3]
 LOGGER = logging.getLogger()
@@ -68,6 +73,15 @@ def parse_args():
     parser.add_argument('-d', '--delay', default=DEFAULT_DELAY, type=int,
             help='Delay between iostat queries, in seconds (default: %d).'
                  % DEFAULT_DELAY)
+
+    parser.add_argument('-a', '--agent', default=DEFAULT_AGENT,
+            help='Type of agent to send data (default: %s).' % DEFAULT_AGENT)
+    parser.add_argument('-s', '--host', default=DEFAULT_HOST,
+            help='IP of machine running agent.')
+    parser.add_argument('-p', '--port', default=DEFAULT_PORT, type=int,
+            help='Agent port receiving data.')
+    parser.add_argument('-e', '--emit', action='store_true',
+            help='Send points to agent for real.')
 
     parser.add_argument('-L', '--loglevel', choices=LOG_LEVELS,
             default=DEFAULT_LOG_LEVEL, help='Set the logging level.')
@@ -102,21 +116,22 @@ def get_parameters(line):
     return param_type, param_list
 
 
-def process_line(line, params, hostname):
-    """Output iostat line.
+def extract_line_data(line, params):
+    """Extract iostat data.
 
-    If the line is not a data line, nothing will be shown.
+    If the line is not a data line, nothing will be extracted.
 
     Args:
-        line: The line to parse and output.
-        params: A list of parameters contained in the line.
-        hostname: Name of the host reporting the data line.
+        line: The line to parse.
+        params: A list of parameters expected in the line.
 
     Returns:
-        Boolean: True if device line was processed, False otherwise.
+        A list of data objects.  Each object contains:
+            device: Device to which the data belong.
+            param: Parameter being measured.
+            value: Value of the parameter being measured.
     """
-    device = None
-    values = []
+    return_data = []
     if line.strip():
         LOGGER.debug(line)
         parts = line.split()
@@ -126,12 +141,55 @@ def process_line(line, params, hostname):
         elif len(parts) == len(params):
             device = 'cpu'
             values = parts
+        else:
+            device = None
 
-        for index, value in enumerate(values):
-            print('PUTVAL %s/iostatplugin/gauge-%s/%s N:%s'
-                  % (hostname, device, params[index], value))
-    return_status = bool(values)
-    return return_status
+        if device:
+            for index, value in enumerate(values):
+                datum = {
+                        'device': device,
+                        'param': params[index],
+                        'value': value,
+                        }
+                return_data.append(datum)
+    return return_data
+
+
+def output_data(data, agent, hostname, host=None, port=None, emit=False):
+    """Output data to the specified agent.
+
+    Args:
+        data: List of data objects.
+        agent: Type of agent to use.
+        hostname: Name of host to which the data belong.
+        host: Agent host address.
+        port: Agent port.
+        emit: Boolean; if False, the data will only be shown on screen.
+    """
+    if agent == 'graphite':
+        template = "iostat.{1}.{2} {3} host='{0}'"
+    else:
+        template = 'PUTVAL {0}/iostat/gauge-{1}/{2} N:{3}'
+    for datum in data:
+        line = template.format(hostname, datum['device'], datum['param'],
+                               datum['value'])
+        if emit and agent == 'graphite':
+            transmit_line(host, port, line)
+        print(line)
+
+
+def transmit_line(host, port, line):
+    """Transmit data line to metrics agent.
+
+    Args:
+        host: Host IP.
+        port: Host port.
+        line: Metric line to send, in Graphite format.
+    """
+    sock = socket.socket()
+    sock.connect((host, port))
+    sock.sendall('%s\n' % line)
+    sock.close()
 
 
 def main():
@@ -167,7 +225,11 @@ def main():
             return_code = 1
             do_it = False
         elif io_stats:
-            if not process_line(line, io_stats, hostname):
+            data = extract_line_data(line, io_stats)
+            if data:
+                output_data(data, ARGS.agent, hostname, ARGS.host, ARGS.port,
+                            ARGS.emit)
+            else:
                 io_stats = None
         else:
             stat_type, io_stats = get_parameters(line)
